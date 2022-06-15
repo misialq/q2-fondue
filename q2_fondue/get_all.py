@@ -19,8 +19,9 @@ threading.excepthook = handle_threaded_exception
 
 
 def get_all(
-        ctx, accession_ids, email, n_jobs=1, retries=2, log_level='INFO',
-        linked_doi=None):
+        ctx, accession_ids, email, n_jobs=1, retries=2,
+        log_level='INFO', linked_doi=None, mode='regular'
+):
 
     # get required methods
     get_metadata = ctx.get_action('fondue', 'get_metadata')
@@ -38,7 +39,7 @@ def get_all(
         'NCBIAccessionIDs', pd.Series(metadata.view(pd.DataFrame).index)
     )
     seq_single, seq_paired, failed_ids, = get_sequences(
-        run_ids, email, retries, n_jobs, log_level
+        run_ids, email, retries, n_jobs, log_level, mode
     )
 
     failed_ids_df = failed_ids_df.append(failed_ids.view(pd.DataFrame))

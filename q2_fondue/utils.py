@@ -5,7 +5,7 @@
 #
 # The full license is in the file LICENSE, distributed with this software.
 # ----------------------------------------------------------------------------
-
+import logging
 import os
 import signal
 import subprocess
@@ -135,6 +135,42 @@ def _has_enough_space(acc_id: str, output_dir: str) -> bool:
         return True
 
 
+def _get_required_space(acc_id: str, output_dir: str):
+    cmd_fasterq = ['fasterq-dump', '--size-check', 'only', '-x', acc_id]
+    result = subprocess.run(
+        cmd_fasterq, text=True, capture_output=True, cwd=output_dir
+    )
+    if result.returncode == 0 and 'est. output' in result.stderr:
+        # TODO: convert into a function
+        size = 0
+        for line in result.stderr.split('\n'):
+            if line.startswith('est. output'):
+                size = line.split(':')[-1]
+                for to_replace in (',', 'bytes'):
+                    size = size.replace(to_replace, '')
+                size = int(size.strip())
+                break
+        return size
+    elif result.returncode == 3 and 'disk-limit exeeded' in result.stderr:
+        LOGGER.debug('Not enough space to fetch %s.', acc_id)
+        size = 0
+        for line in result.stderr.split('\n'):
+            if line.startswith('est. output'):
+                size = line.split(':')[-1]
+                for to_replace in (',', 'bytes'):
+                    size = size.replace(to_replace, '')
+                size = int(size.strip())
+                break
+        return size
+    else:
+        LOGGER.warning(
+            'fasterq-dump return an unexpected response. Return code was %i, '
+            'stdout was "%s" and stderr was "%s".',
+            result.returncode, result.stdout, result.stderr
+        )
+        return 0
+
+
 def _find_next_id(acc_id: str, progress_bar: tqdm):
     pbar_content = list(progress_bar)
     index_next_acc = pbar_content.index(acc_id) + 1
@@ -142,3 +178,36 @@ def _find_next_id(acc_id: str, progress_bar: tqdm):
         return None
     else:
         return pbar_content[index_next_acc]
+
+
+def add_logging_level(level_name, level_num):
+    """
+    Modified from https://stackoverflow.com/a/35804945
+    Comprehensively adds a new logging level to the `logging` module and the
+    currently configured logging class.
+
+    `level_name` becomes an attribute of the `logging` module with the value
+    `level_num`. `methodName` becomes a convenience method for both `logging`
+    itself and the class returned by `logging.getLoggerClass()` (usually just
+    `logging.Logger`).
+
+    Example
+    -------
+        >>> add_logging_level('TRACE', logging.DEBUG - 5)
+        >>> logging.getLogger(__name__).setLevel("TRACE")
+        >>> logging.getLogger(__name__).trace('that worked')
+        >>> logging.trace('so did this')
+    """
+    method_name = level_name.lower()
+
+    def log_for_level(self, message, *args, **kwargs):
+        if self.isEnabledFor(level_num):
+            self._log(level_num, message, args, **kwargs)
+
+    def log_to_root(message, *args, **kwargs):
+        logging.log(level_num, message, *args, **kwargs)
+
+    logging.addLevelName(level_num, level_name)
+    setattr(logging, level_name, level_num)
+    setattr(logging.getLoggerClass(), method_name, log_for_level)
+    setattr(logging, method_name, log_to_root)

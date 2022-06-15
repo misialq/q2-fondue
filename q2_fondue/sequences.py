@@ -8,7 +8,9 @@
 from multiprocessing.managers import SyncManager
 
 import glob
-from multiprocessing import Pool, Queue, Process, Manager, cpu_count
+from multiprocessing import (
+    Pool, Queue, Process, Manager, cpu_count, Lock, Value
+)
 
 import gzip
 import os
@@ -32,28 +34,71 @@ from q2_fondue.entrezpy_clients._pipelines import _get_run_ids
 from q2_fondue.entrezpy_clients._utils import set_up_logger
 from q2_fondue.utils import (
     _determine_id_type, handle_threaded_exception, DownloadError,
-    _has_enough_space, _find_next_id
+    _get_required_space, add_logging_level
 )
 
 threading.excepthook = handle_threaded_exception
 
+add_logging_level('TRACE', 5)
 LOGGER = set_up_logger('INFO', logger_name=__name__)
 
 
-def _run_cmd_fasterq(
-        acc: str, output_dir: str, threads: int):
-    """Runs fasterq-dump command on a single accession."""
-    cmd_prefetch = ['prefetch', '-X', 'u', '-O', acc, acc]
-    cmd_fasterq = [
-        'fasterq-dump', '-e', str(threads), '--size-check', 'on', '-x', acc
+def _run_cmd_vdbconfig(output_dir: str):
+    """Runs vdb-config command."""
+    cache_loc = os.path.join(output_dir, 'cache')
+    cmd_vdbconfig = [
+        'vdb-config', '-s', f'/repository/user/main/public/root={cache_loc}'
     ]
 
     result = subprocess.run(
-        cmd_prefetch, text=True, capture_output=True, cwd=output_dir)
-
+        cmd_vdbconfig, text=True, capture_output=True, cwd=output_dir)
     if result.returncode == 0:
+        LOGGER.debug('Cache location changed to %s.', cache_loc)
+    else:
+        LOGGER.warning(
+            'Failed to change the cache location. The error was: %s.',
+            result.stderr
+        )
+
+
+def _run_cmd_prefetch(
+        acc: str, output_dir: str, fetched_queue: Queue,
+        failed_ids: dict, lock: Lock, reserved_space: Value,
+        required_space: int, pbar: tqdm
+):
+    """Runs prefetch command on a single accession."""
+    cmd_prefetch = ['prefetch', '-X', 'u', '-O', acc, acc]
+
+    result = subprocess.run(
+        cmd_prefetch, text=True, capture_output=True, cwd=output_dir)
+    if result.returncode == 0:
+        LOGGER.trace('Submitting %s to the fetched_queue.', acc)
+        # we don't update reserved_space here - fasterq-dump will do it
+        fetched_queue.put((acc, required_space))
+    else:
+        LOGGER.trace('Failed to prefetch %s.', acc)
+        with lock:
+            failed_ids[acc] = result.stderr
+            pbar.postfix = f'{len(failed_ids)} failed'
+            reserved_space.value -= required_space
+
+
+def _run_cmd_fasterq(
+        output_dir: str, threads: int, fetched_queue: Queue,
+        fastered_queue: Queue, failed_ids: dict, lock: Lock,
+        reserved_space: Value, log_level: str, fasterq_workers: int
+):
+    """Runs fasterq-dump command on a single accession."""
+    LOGGER.setLevel(log_level.upper())
+    for (acc, required_space) in iter(fetched_queue.get, None):
+        LOGGER.trace('Picked up %s from the fetched_queue.', acc)
+        # TODO: set the no. of threads back to the previous value
+        cmd_fasterq = [
+            'fasterq-dump', '-e', '2', '--size-check', 'on', '-x', acc
+        ]
         result = subprocess.run(
             cmd_fasterq, text=True, capture_output=True, cwd=output_dir)
+
         # clean up prefetch files on success
         if result.returncode == 0:
             sra_path = os.path.join(output_dir, acc)
@@ -61,16 +106,39 @@ def _run_cmd_fasterq(
                 shutil.rmtree(sra_path)
             elif os.path.isfile(f'{sra_path}.sra'):
                 os.remove(f'{sra_path}.sra')
+
+            sra_cache_path = os.path.join(output_dir, 'cache', 'sra', acc)
+            if os.path.isfile(f'{sra_cache_path}.sra'):
+                os.remove(f'{sra_cache_path}.sra')
+            if os.path.isfile(f'{sra_cache_path}.sra.cache'):
+                os.remove(f'{sra_cache_path}.sra.cache')
+
+            LOGGER.trace('Submitting %s to the fastered_queue.', acc)
+            fastered_queue.put(acc)
         elif result.returncode == 3 and 'disk-limit exeeded' in result.stderr:
             LOGGER.error(
                 'Not enough space for fasterq-dump to process ID=%s.', acc
             )
-    return result
+            # TODO: shouldn't the files also be cleaned up here and below?
+            with lock:
+                failed_ids[acc] = result.stderr
+        else:
+            LOGGER.trace('Failed to process %s with fasterq-dump.', acc)
+            with lock:
+                failed_ids[acc] = result.stderr
+
+        with lock:
+            reserved_space.value -= required_space
+
+    # let the queue know that fasterq finished processing
+    LOGGER.trace("All sequences processed by fasterq-dump.")
+    # [fastered_queue.put(None) for _ in range(fasterq_workers)]
+    fastered_queue.put(None)
 
 
 def _get_remaining_ids_with_storage_error(acc_id: str, progress_bar: tqdm):
     """Finds remaining ids and appends storage exhaustion error message."""
-    index_next_acc = list(progress_bar).index(acc_id) + 1
+    index_next_acc = list(progress_bar).index(acc_id)
     remaining_ids = list(progress_bar)[index_next_acc:]
     remaining_ids = dict(zip(
         remaining_ids, len(remaining_ids) * ['Storage exhausted.']
@@ -79,8 +147,9 @@ def _get_remaining_ids_with_storage_error(acc_id: str, progress_bar: tqdm):
 
 
 def _run_fasterq_dump_for_all(
-        accession_ids, tmpdirname, threads, retries,
-        fetched_queue, done_queue
+        accession_ids, tmpdirname, retries, fetched_queue,
+        done_queue, failed_ids, lock, reserved_space, fasterq_workers,
+        log_level
 ):
     """Runs prefetch & fasterq-dump for all ids in accession_ids.
 
@@ -97,38 +166,36 @@ def _run_fasterq_dump_for_all(
     Returns:
         failed_ids (dict): Failed run IDs with corresponding errors.
     """
+    LOGGER.setLevel(log_level.upper())
     LOGGER.info(
         f'Downloading sequences for {len(accession_ids)} accession IDs...'
     )
     accession_ids_init = accession_ids.copy()
     init_retries = retries
-    _, _, init_free_space = shutil.disk_usage(tmpdirname)
 
     while (retries >= 0) and (len(accession_ids) > 0):
-        failed_ids = {}
         pbar = tqdm(sorted(accession_ids))
         for acc in pbar:
             pbar.set_description(
                 f'Downloading sequences for run {acc} '
                 f'(attempt {-retries + init_retries + 1})'
             )
-            result = _run_cmd_fasterq(
-                acc, tmpdirname, threads)
-            if result.returncode != 0:
-                failed_ids[acc] = result.stderr
-            else:
-                fetched_queue.put(acc)
-            pbar.postfix = f'{len(failed_ids)} failed'
 
             # check space availability
+            required_space = _get_required_space(acc, tmpdirname)
+            with lock:
+                reserved_space.value += required_space
             _, _, free_space = shutil.disk_usage(tmpdirname)
-            used_seq_space = init_free_space - free_space
-            # current space threshold: 35% of fetched seq space as evaluated
-            # from 6 random run and ProjectIDs
-            if free_space < (0.35 * used_seq_space) and not \
-                    _has_enough_space(_find_next_id(acc, pbar), tmpdirname):
-                failed_ids.update(
-                    _get_remaining_ids_with_storage_error(acc, pbar))
+            LOGGER.debug(
+                '[%s] Free: %i,\trequired: %i,\treserved: %i',
+                acc, free_space, required_space, reserved_space.value
+            )
+            if 1.15 * reserved_space.value > free_space:
+                with lock:
+                    failed_ids.update(
+                        _get_remaining_ids_with_storage_error(acc, pbar)
+                    )
+                # TODO: this warning should only come when no more retries
                 LOGGER.warning(
                     'Available storage was exhausted - there will be no '
                     'more retries.'
@@ -136,13 +203,22 @@ def _run_fasterq_dump_for_all(
                 retries = -1
                 break
 
+            _run_cmd_prefetch(
+                acc, tmpdirname, fetched_queue, failed_ids, lock,
+                reserved_space, required_space, pbar
+            )
+
+        while not fetched_queue.empty():
+            # we need to wait until all prefetched files are picked up
+            # for processing before continuing
+            time.sleep(1)
+
         if len(failed_ids.keys()) > 0 and retries > 0:
             # log & add time buffer if we retry
             sleep_lag = (1 / (retries + 1)) * 180
-            ls_failed_ids = list(failed_ids.keys())
             LOGGER.info(
                 f'Retrying to download the following failed accession IDs in '
-                f'{round(sleep_lag / 60, 1)} min: {ls_failed_ids}'
+                f'{round(sleep_lag / 60, 1)} min: {list(failed_ids.keys())}'
             )
             time.sleep(sleep_lag)
 
@@ -150,7 +226,7 @@ def _run_fasterq_dump_for_all(
         retries -= 1
 
     msg = 'Download finished.'
-    fetched_queue.put(None)
+    [fetched_queue.put(None) for _ in range(fasterq_workers)]
     if failed_ids:
         errors = '\n'.join(
             [f'ID={x}, Error={y}' for x, y in list(failed_ids.items())[:5]]
@@ -185,26 +261,43 @@ def _process_one_sequence(filename, output_dir):
 
 
 def _process_downloaded_sequences(
-        output_dir, fetched_queue, renaming_queue, n_workers
+        output_dir, fastered_queue, renaming_queue,
+        n_workers, n_fasterq_workers, log_level
 ):
     """Processes downloaded sequences.
 
     Picks up filenames of fetched sequences from the fetched_queue, renames
     them and inserts processed filenames into the renaming_queue when finished.
     """
-    for _id in iter(fetched_queue.get, None):
-        filenames = glob.glob(os.path.join(output_dir, f'{_id}*.fastq'))
-        filenames = [
-            _process_one_sequence(f, output_dir) for f in filenames
-        ]
-        single = [x for x in filenames if not x[1]]
-        paired = sorted([x for x in filenames if x[1]])
+    LOGGER.setLevel(log_level.upper())
+    LOGGER.trace('Waiting for fastered sequences...')
+    ready_workers = 0
+    while True:
+    # for _id in iter(fastered_queue.get, None):
+        _id = fastered_queue.get()
+        LOGGER.trace('Got %s', _id)
+        if _id is None:
+            ready_workers += 1
+            if ready_workers >= n_fasterq_workers:
+                break
+            else:
+                continue
+        else:
+            LOGGER.trace('Picked up %s from the fastered_queue.', _id)
+            filenames = glob.glob(os.path.join(output_dir, f'{_id}*.fastq'))
+            filenames = [
+                _process_one_sequence(f, output_dir) for f in filenames
+            ]
+            single = [x for x in filenames if not x[1]]
+            paired = sorted([x for x in filenames if x[1]])
 
-        renaming_queue.put(single) if single else False
-        renaming_queue.put(paired) if paired else False
+            LOGGER.trace('Submitting %s to the renaming_queue.', _id)
+            renaming_queue.put(single) if single else False
+            renaming_queue.put(paired) if paired else False
 
     # tell all the workers we are done
     [renaming_queue.put(None) for i in range(n_workers)]
+    LOGGER.trace('All sequences renamed.')
 
 
 def _write_empty_casava(read_type, casava_out_path):
@@ -250,7 +343,7 @@ def _copy_to_casava(
 
 def _write2casava_dir(
         tmp_dir, casava_out_single, casava_out_paired,
-        renaming_queue, done_queue
+        renaming_queue, done_queue, log_level
 ):
     """Writes single- or paired-end files to casava directory.
 
@@ -260,16 +353,20 @@ def _write2casava_dir(
     while [('fileB_1', True), ('fileB_2', True)] as paired-end.
     When done, it inserts filenames into the done_queue to announce completion.
     """
+    LOGGER.setLevel(log_level.upper())
     for filenames in iter(renaming_queue.get, None):
+        LOGGER.trace('Picked up %s from the renaming_queue.', filenames)
         if len(filenames) == 1:
             filename = os.path.split(filenames[0][0])[-1]
             _copy_to_casava([filename], tmp_dir, casava_out_single)
+            LOGGER.trace('Submitting %s to the done_queue.', filename)
             done_queue.put([filename])
         elif len(filenames) == 2:
             filenames = [
                 os.path.split(x[0])[-1] for x in sorted(filenames)
             ]
             _copy_to_casava(filenames, tmp_dir, casava_out_paired)
+            LOGGER.trace('Submitting %s to the done_queue.', filenames)
             done_queue.put(filenames)
         renaming_queue.task_done()
     return True
@@ -292,6 +389,7 @@ def _announce_completion(queue: SyncManager.Queue):
         single_files (list): Filename list for all single-end reads.
         paired_files (list): Filename list for all paired-end reads.
     """
+    LOGGER.trace('Announcing completion.')
     queue.put(None)
     results = []
     failed_ids = {}
@@ -307,7 +405,7 @@ def _announce_completion(queue: SyncManager.Queue):
 
 def get_sequences(
         accession_ids: Metadata, email: str, retries: int = 2,
-        n_jobs: int = 1, log_level: str = 'INFO',
+        n_jobs: int = 1, log_level: str = 'INFO', mode: str = 'regular'
 ) -> (CasavaOneEightSingleLanePerSampleDirFmt,
       CasavaOneEightSingleLanePerSampleDirFmt,
       pd.DataFrame):
@@ -326,6 +424,8 @@ def get_sequences(
         retries (int, default=2): Number of retries to fetch sequences.
         n_jobs (int, default=1): Number of threads to be used in parallel.
         log_level (str, default='INFO'): Logging level.
+        mode (str, default='regular'): Download mode. 'large' for
+            (meta)genomes, 'regular' for anything else.
 
     Returns:
         Two directories with fetched single-read and paired-end sequences
@@ -350,41 +450,84 @@ def get_sequences(
 
     fetched_q = Queue()
     manager = Manager()
+    fastered_q = manager.Queue()
     renamed_q = manager.Queue()
     processed_q = manager.Queue()
 
+    failed_ids = {}
+    reserved_space = Value('d', 0.0)
+    worker_count = int(min(max(n_jobs - 1, 1), cpu_count() - 1))
+    fasterq_workers = 1
+    if mode == 'large':
+        # TODO: change this back to auto-calculation
+        fasterq_workers = min(1, max(1, int(0.5 * worker_count)))
+        worker_count = max(1, worker_count - fasterq_workers)
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # run fasterq-dump for all accessions
-        fetcher_process = Process(
+        # adjust cache location so that we can clean up properly
+        _run_cmd_vdbconfig(tmp_dir)
+
+        # we need a lock for synchronization
+        lock = Lock()
+
+        # run prefetch for all accessions
+        prefetcher_thread = threading.Thread(
             target=_run_fasterq_dump_for_all,
             args=(
-                sorted(accession_ids), tmp_dir, n_jobs, retries,
-                fetched_q, processed_q
+                sorted(accession_ids), tmp_dir, retries, fetched_q,
+                processed_q, failed_ids, lock, reserved_space,
+                fasterq_workers, log_level
             ),
             daemon=True
         )
+
+        # run fasterq-dump process
+        # TODO: test how it works when using a thread instead
+        LOGGER.debug(
+            'Using %i workers for fasterq-dump processing '
+            'and %i for post-processing.', fasterq_workers, worker_count
+        )
+        if mode == 'large':
+            fasterq_process = Pool(
+                fasterq_workers, _run_cmd_fasterq,
+                (tmp_dir, n_jobs, fetched_q, fastered_q, failed_ids,
+                 lock, reserved_space, log_level, fasterq_workers)
+            )
+        else:
+            fasterq_process = Process(
+                target=_run_cmd_fasterq,
+                args=(
+                    tmp_dir, n_jobs, fetched_q, fastered_q, failed_ids,
+                    lock, reserved_space, log_level, fasterq_workers
+                ),
+                daemon=True
+            )
+
         # processing downloaded files
-        worker_count = int(min(max(n_jobs - 1, 1), cpu_count() - 1))
-        LOGGER.debug(f'Using {worker_count} workers.')
         renamer_process = Process(
             target=_process_downloaded_sequences,
-            args=(tmp_dir, fetched_q, renamed_q, worker_count),
+            args=(
+                tmp_dir, fastered_q, renamed_q, worker_count,
+                fasterq_workers, log_level
+            ),
             daemon=True
         )
         # writing to Casava directory
         worker_pool = Pool(
             worker_count, _write2casava_dir,
             (tmp_dir, str(casava_out_single.path),
-             str(casava_out_paired.path), renamed_q, processed_q)
+             str(casava_out_paired.path), renamed_q, processed_q, log_level)
         )
 
         # start all processes
-        fetcher_process.start()
+        prefetcher_thread.start()
+        fasterq_process.close() if mode == 'large' else fasterq_process.start()
         renamer_process.start()
         worker_pool.close()
 
         # wait for all the results
-        fetcher_process.join()
+        prefetcher_thread.join()
+        fasterq_process.join()
         renamer_process.join()
         worker_pool.join()
 

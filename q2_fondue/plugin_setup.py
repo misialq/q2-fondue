@@ -44,7 +44,7 @@ common_input_descriptions = {
 common_params = {
     'email': Str,
     'n_jobs': Int % Range(1, None),
-    'log_level': Str % Choices(['DEBUG', 'INFO', 'WARNING', 'ERROR']),
+    'log_level': Str % Choices(['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR']),
 }
 
 common_param_descr = {
@@ -120,7 +120,8 @@ plugin.methods.register_function(
     inputs={**common_inputs},
     parameters={
         **common_params,
-        'retries': Int % Range(0, None)
+        'retries': Int % Range(0, None),
+        'mode': Str % Choices(['regular', 'large'])
     },
     outputs=[
         ('single_reads', SampleData[SequencesWithQuality]),
@@ -131,6 +132,10 @@ plugin.methods.register_function(
     parameter_descriptions={
         **common_param_descr,
         'retries': 'Number of retries to fetch sequences (default: 2).',
+        'mode': 'Download mode: choose "large" for big datasets (i.e., large '
+                'datafiles per ID, mostly in case of metagenomes) - this will '
+                'split the parallel worker pools in a way optimal to process '
+                'such data. Otherwise, choose "regular"'
     },
     output_descriptions={
         'single_reads': output_descriptions['single_reads'],
@@ -148,7 +153,8 @@ plugin.pipelines.register_function(
             'linked_doi': NCBIAccessionIDs},
     parameters={
         **common_params,
-        'retries': Int % Range(0, None)
+        'retries': Int % Range(0, None),
+        'mode': Str % Choices(['regular', 'large'])
     },
     outputs=[
         ('metadata', SRAMetadata),
@@ -162,7 +168,11 @@ plugin.pipelines.register_function(
     },
     parameter_descriptions={
         **common_param_descr,
-        'retries': 'Number of retries to fetch sequences (default: 2).'
+        'retries': 'Number of retries to fetch sequences (default: 2).',
+        'mode': 'Download mode: choose "large" for big datasets (i.e., large '
+                'datafiles per ID, mostly in case of metagenomes) - this will '
+                'split the parallel worker pools in a way optimal to process '
+                'such data. Otherwise, choose "regular"'
     },
     output_descriptions={
         'metadata': output_descriptions['metadata'],
