@@ -12,7 +12,27 @@
 </p><br>
 
 ## Installation
-Before q2-fondue is available *via* conda, you can use the following instructions to install it on your machine by creating a new conda environment. The current q2-fondue version supports QIIME 2 **v2021.4** or higher.
+There are two ways to install q2-fondue: from conda or directly from this repository (using pip).
+
+### Conda
+q2-fondue is available from the *dev* QIIME 2 conda channel. To create a new conda environment 
+and install q2-fondue simply run:
+```shell
+conda create -yn fondue \
+  -c https://packages.qiime2.org/qiime2/2022.4/tested \
+  -c bioconda -c conda-forge -c default q2-fondue q2cli
+
+conda activate fondue
+```
+
+Configuration of the wrapped SRA Toolkit should be automatically performed during installation. 
+In case you need to configure a proxy server run:
+```shell
+vdb-config --proxy <your proxy URL> --proxy-disable no
+```
+
+### This repository
+Alternatively, you can use the following instructions to install q2-fondue using pip. The current q2-fondue version supports QIIME 2 **v2021.4** or higher.
 
 * Create and activate a conda environment with the required dependencies:
 ```shell
