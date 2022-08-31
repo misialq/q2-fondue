@@ -186,7 +186,7 @@ def _run_fasterq_dump_for_all(
             with lock:
                 reserved_space.value += required_space
             _, _, free_space = shutil.disk_usage(tmpdirname)
-            LOGGER.debug(
+            LOGGER.trace(
                 '[%s] Free: %i,\trequired: %i,\treserved: %i',
                 acc, free_space, required_space, reserved_space.value
             )
