@@ -121,7 +121,8 @@ plugin.methods.register_function(
     parameters={
         **common_params,
         'retries': Int % Range(0, None),
-        'mode': Str % Choices(['regular', 'large'])
+        'mode': Str % Choices(['regular', 'large']),
+        'n_fasterq_jobs': Int % Range(1, None)
     },
     outputs=[
         ('single_reads', SampleData[SequencesWithQuality]),
@@ -135,7 +136,8 @@ plugin.methods.register_function(
         'mode': 'Download mode: choose "large" for big datasets (i.e., large '
                 'datafiles per ID, mostly in case of metagenomes) - this will '
                 'split the parallel worker pools in a way optimal to process '
-                'such data. Otherwise, choose "regular"'
+                'such data. Otherwise, choose "regular"',
+        'n_fasterq_jobs': 'Number of workers for processing by fasterq-dump.'
     },
     output_descriptions={
         'single_reads': output_descriptions['single_reads'],

@@ -14,7 +14,7 @@ from qiime2 import Artifact
 
 def run_main():
     ids = Artifact.import_data(
-        "NCBIAccessionIDs", "ids-large.tsv"
+        "NCBIAccessionIDs", "ids-small.tsv"
     )
 
     print("Fetching sequences (1)...")
@@ -22,6 +22,7 @@ def run_main():
         accession_ids=ids,
         email="mziemski@ethz.ch",
         n_jobs=7,
+        n_fasterq_jobs=2,
         log_level="TRACE",
         mode="large",
     )
@@ -32,7 +33,32 @@ def run_main():
     seqs = fondue.methods.get_sequences(
         accession_ids=ids,
         email="mziemski@ethz.ch",
+        n_jobs=9,
+        n_fasterq_jobs=4,
+        log_level="TRACE",
+        mode="large",
+    )
+    del seqs
+    time.sleep(300)
+
+    print("Fetching sequences (3)...")
+    seqs = fondue.methods.get_sequences(
+        accession_ids=ids,
+        email="mziemski@ethz.ch",
+        n_jobs=7,
+        n_fasterq_jobs=1,
+        log_level="TRACE",
+        mode="large",
+    )
+    del seqs
+    time.sleep(300)
+
+    print("Fetching sequences (4)...")
+    seqs = fondue.methods.get_sequences(
+        accession_ids=ids,
+        email="mziemski@ethz.ch",
         n_jobs=6,
+        n_fasterq_jobs=1,
         log_level="TRACE",
         mode="regular",
     )

@@ -405,7 +405,8 @@ def _announce_completion(queue: SyncManager.Queue):
 
 def get_sequences(
         accession_ids: Metadata, email: str, retries: int = 2,
-        n_jobs: int = 1, log_level: str = 'INFO', mode: str = 'regular'
+        n_jobs: int = 1, n_fasterq_jobs: int = 1,
+        log_level: str = 'INFO', mode: str = 'regular'
 ) -> (CasavaOneEightSingleLanePerSampleDirFmt,
       CasavaOneEightSingleLanePerSampleDirFmt,
       pd.DataFrame):
@@ -460,8 +461,9 @@ def get_sequences(
     fasterq_workers = 1
     if mode == 'large':
         # TODO: change this back to auto-calculation
-        fasterq_workers = min(1, max(1, int(0.5 * worker_count)))
-        worker_count = max(1, worker_count - fasterq_workers)
+        # fasterq_workers = min(1, max(1, int(0.5 * worker_count)))
+        # worker_count = max(1, worker_count - fasterq_workers)
+        worker_count = max(1, worker_count - n_fasterq_jobs)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # adjust cache location so that we can clean up properly
@@ -476,7 +478,7 @@ def get_sequences(
             args=(
                 sorted(accession_ids), tmp_dir, retries, fetched_q,
                 processed_q, failed_ids, lock, reserved_space,
-                fasterq_workers, log_level
+                n_fasterq_jobs, log_level
             ),
             daemon=True
         )
@@ -485,20 +487,20 @@ def get_sequences(
         # TODO: test how it works when using a thread instead
         LOGGER.debug(
             'Using %i workers for fasterq-dump processing '
-            'and %i for post-processing.', fasterq_workers, worker_count
+            'and %i for post-processing.', n_fasterq_jobs, worker_count
         )
         if mode == 'large':
             fasterq_process = Pool(
-                fasterq_workers, _run_cmd_fasterq,
+                n_fasterq_jobs, _run_cmd_fasterq,
                 (tmp_dir, n_jobs, fetched_q, fastered_q, failed_ids,
-                 lock, reserved_space, log_level, fasterq_workers)
+                 lock, reserved_space, log_level, n_fasterq_jobs)
             )
         else:
             fasterq_process = Process(
                 target=_run_cmd_fasterq,
                 args=(
                     tmp_dir, n_jobs, fetched_q, fastered_q, failed_ids,
-                    lock, reserved_space, log_level, fasterq_workers
+                    lock, reserved_space, log_level, n_fasterq_jobs
                 ),
                 daemon=True
             )
@@ -508,7 +510,7 @@ def get_sequences(
             target=_process_downloaded_sequences,
             args=(
                 tmp_dir, fastered_q, renamed_q, worker_count,
-                fasterq_workers, log_level
+                n_fasterq_jobs, log_level
             ),
             daemon=True
         )
